@@ -2,9 +2,12 @@ const { app, BrowserWindow, ipcMain, Menu, dialog, shell } = require('electron')
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const crypto = require('crypto');
 const pty = require('node-pty');
 const chokidar = require('chokidar');
 const { execFile, spawn } = require('child_process');
+const { createGit } = require('./git');
+const { parseTopLevelParts } = require('./scad-parts');
 
 // Resolve the OpenSCAD binary: prefer bundled copy, fall back to env / system.
 // In packaged builds, extraResources lands at process.resourcesPath.
@@ -66,7 +69,13 @@ function openscadEnv() {
   return process.env;
 }
 const STATE_FILE = 'clawscad.json';
-const ACTIVE_FILE = 'active.scad';
+const ENTRY_FILE = 'model.scad';
+// Snapshot of the selected checkpoint in the file-per-version workflow; only read to seed ENTRY_FILE.
+const LEGACY_ACTIVE_FILE = 'active.scad';
+const CACHE_DIR = path.join('.clawscad', 'cache');
+// CLAUDE.md and .claude/ are rewritten per machine and per open-window set; tracking them would add noise commits.
+const GITIGNORE_LINES = ['*.stl', '*.3mf', '.clawscad/', 'RENDER_ERRORS.md', LEGACY_ACTIVE_FILE, STATE_FILE, 'CLAUDE.md', '.claude/'];
+const COMMIT_DEBOUNCE_MS = 2000;
 const MAX_WINDOWS = 4;
 
 // ── OpenSCAD MCP Client ─────────────────────────────────────────────────
@@ -254,7 +263,12 @@ function openWindow(wsDir) {
   const ctx = {
     window: win,
     workspaceDir: wsDir,
-    state: { checkpoints: {}, active: null },
+    state: { labels: {} },
+    history: emptyHistory(null),
+    historyReady: Promise.resolve(),
+    historyLock: Promise.resolve(),
+    git: null,
+    commitTimer: null,
     fileWatcher: null,
     ptyProcess: null,
     renderQueue: [],
@@ -267,32 +281,18 @@ function openWindow(wsDir) {
 
   win.loadFile('index.html');
 
-  initWorkspace(ctx);
-  loadState(ctx);
-  startTerminal(ctx);
-  startFileWatcher(ctx);
-
-  win.setTitle(`ClawSCAD — ${ctx.workspaceDir}`);
+  activateWorkspace(ctx);
 
   win.webContents.once('did-finish-load', () => {
-    sendCheckpoints(ctx);
-    if (ctx.state.active && ctx.state.checkpoints[ctx.state.active]) {
-      const cp = ctx.state.checkpoints[ctx.state.active];
-      sendFileContent(ctx, cp.file);
-      const scadPath = path.join(ctx.workspaceDir, cp.file);
-      const tmfPath = scadPath.replace(/\.scad$/, '.3mf');
-      const stlPath = scadToStl(scadPath);
-      if (fs.existsSync(tmfPath)) {
-        sendModel(ctx, tmfPath, '3mf');
-      } else if (fs.existsSync(stlPath)) {
-        sendModel(ctx, stlPath, 'stl');
-      } else {
-        enqueueRender(ctx, scadPath);
-      }
-    }
+    ctx.historyReady.then(() => {
+      sendCheckpoints(ctx);
+      showCurrentModel(ctx);
+    });
   });
 
   win.on('closed', () => {
+    clearTimeout(ctx.commitTimer);
+    withHistoryLock(ctx, () => autoCommit(ctx)).catch(() => {});
     if (ctx.fileWatcher) ctx.fileWatcher.close();
     if (ctx.ptyProcess) try { ctx.ptyProcess.kill(); } catch {}
     if (ctx.ptyProcess2) try { ctx.ptyProcess2.kill(); } catch {}
@@ -309,9 +309,21 @@ function openWindow(wsDir) {
 // ── Workspace Init ──────────────────────────────────────────────────────
 
 const CLAUDE_MD_RULES = `## File Rules (NEVER break these)
-- **NEVER modify or overwrite an existing .scad file.** Every .scad file is an immutable checkpoint. Overwriting one destroys the user's version history. Always create a NEW file.
-- **Name each .scad file** with a short creative descriptive name in kebab-case (max 30 characters, no sequential numbers). The name should hint at what changed. Good: \`hollow-shaft-gear.scad\`, \`rounded-blue-body.scad\`, \`tapered-legs-v2.scad\`. Bad: \`model_003.scad\`, \`update.scad\`.
-- **First line of every .scad file MUST be a comment** describing what this version adds or changes, e.g.: \`// Hollowed center, added 6 bolt holes around the flange\`. This is shown to the user as a tooltip in the checkpoint history.
+- **The model lives in \`${ENTRY_FILE}\`. Edit it in place** (create it if it does not exist). Do NOT create new copies or versioned files like \`model-v2.scad\` — ClawSCAD commits every change to git automatically, and the History panel shows the git log.
+- **Line 1 of \`${ENTRY_FILE}\` MUST be a comment describing your latest change**, e.g.: \`// Hollowed center, added 6 bolt holes around the flange\`. Rewrite it on every edit — it becomes the commit message shown in the history.
+- **Never run git commands yourself** (no commit, checkout, reset, push). The app owns the repository; the user switches versions from the History panel.
+- Helper files (\`include\`/\`use\` libraries) are allowed next to \`${ENTRY_FILE}\`; they are committed with it.
+
+## Parts — one top-level statement per independent component
+ClawSCAD renders each top-level statement as a separate part the user can show or hide in the viewer. Define every independent component as a module and call each one on its own top-level line:
+\`\`\`scad
+module base() { ... }
+module lid() { ... }
+color("SteelBlue") base();
+color("Gold") translate([0, 0, 30]) lid();
+\`\`\`
+Do NOT wrap the whole assembly in one outer \`union()\`, \`translate()\` or \`{ }\` block — that merges everything into a single part.
+For view switches (e.g. \`part = "assembly";\`), write one independent line per component — \`if (part == "assembly") lid();\` — not an \`if/else\` chain or a wrapper module like \`assembly()\`, which render as one part.
 
 ## Colors — use them extensively
 OpenSCAD's \`color()\` function is fully supported. **Color every part** of your models to make them visually clear:
@@ -321,19 +333,18 @@ color([0.8, 0.2, 0.1]) accent_ring();
 color("#44cc88", 0.8) transparent_cover();
 \`\`\`
 Supported formats: named colors (CSS/SVG names like "Red", "SteelBlue", "Gold"), \`[r,g,b]\` floats 0-1, \`[r,g,b,a]\` with alpha, hex \`"#rrggbb"\`, \`"#rrggbbaa"\`.
-When the user asks to change colors, create a new file (never modify the old one) with the color changes.
 
 ## Workflow
-1. Read \`active.scad\` to understand the current model
-2. Create a new .scad file building on it (never modify the original)
+1. Read \`${ENTRY_FILE}\` to understand the current model — it always reflects the version the user selected in the history
+2. Edit \`${ENTRY_FILE}\` in place and update its first-line comment
 3. **Use the OpenSCAD MCP server to validate your work** — this is critical:
-   - After creating a .scad file, use the MCP \`render\` tool to render it and visually inspect the result
+   - After editing, use the MCP \`render\` tool to render it and visually inspect the result
    - Use \`validate_scad\` to check for syntax errors before rendering
    - Use \`analyze_model\` to check bounding box and dimensions match what the user asked for
-   - If the render shows problems, create a new fixed .scad file (still never modify the broken one)
+   - If the render shows problems, fix \`${ENTRY_FILE}\` again
    - Use \`render_perspectives\` to check the model from multiple angles
-4. The app auto-detects new .scad files and adds them to the checkpoint history tree
-5. Users can click any checkpoint to go back and branch from it — every file is permanent
+4. The app re-renders on every save and commits the change a moment later
+5. Users can click any commit in the history to go back; editing from an older commit starts a new branch automatically
 
 ## MCP Tools Available
 You have access to the \`openscad\` MCP server with these tools — **use them proactively**:
@@ -347,10 +358,10 @@ You have access to the \`openscad\` MCP server with these tools — **use them p
 **Always render and visually verify your output.** Don't just write code and hope — use the MCP tools to see the result and iterate if needed.
 
 ## Auto-Iteration
-ClawSCAD automatically validates your .scad files when they are created. If a render fails:
+ClawSCAD automatically renders \`${ENTRY_FILE}\` whenever a .scad file changes. If a render fails:
 - Errors are written to \`RENDER_ERRORS.md\` in this workspace
 - You will receive a message asking you to fix the issue
-- **Read RENDER_ERRORS.md**, understand the problem, and create a NEW fixed .scad file
+- **Read RENDER_ERRORS.md**, understand the problem, and fix it in place
 - Keep iterating until the render succeeds — don't present broken models to the user
 - Only stop when you have a clean render with no errors`;
 
@@ -434,22 +445,19 @@ function statePath(ctx) {
   return path.join(ctx.workspaceDir, STATE_FILE);
 }
 
+// clawscad.json holds UI-only state: `labels` maps commit SHA → display name.
+// Keys from the file-per-version format (`checkpoints`, `active`) are dropped.
 function loadState(ctx) {
+  ctx.state = { labels: {} };
   try {
-    if (fs.existsSync(statePath(ctx))) {
-      ctx.state = JSON.parse(fs.readFileSync(statePath(ctx), 'utf-8'));
-    }
-  } catch {
-    ctx.state = { checkpoints: {}, active: null };
-  }
+    const saved = JSON.parse(fs.readFileSync(statePath(ctx), 'utf-8'));
+    const { checkpoints, active, ...rest } = saved || {};
+    ctx.state = { ...rest, labels: rest.labels && typeof rest.labels === 'object' ? rest.labels : {} };
+  } catch {}
 }
 
 function saveState(ctx) {
   fs.writeFileSync(statePath(ctx), JSON.stringify(ctx.state, null, 2));
-}
-
-function generateId() {
-  return 'cp_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
 }
 
 function extractDescription(scadPath) {
@@ -491,65 +499,262 @@ function detectCurrentSessionId(ctx) {
   }
 }
 
-function addCheckpoint(ctx, scadFile) {
-  const basename = path.basename(scadFile);
+// ── History (git) ───────────────────────────────────────────────────────
+// The workspace is a git repo; ENTRY_FILE is edited in place and every change
+// is auto-committed. ctx.history mirrors `git log --all` for the renderer:
+// { checkpoints: {sha: node}, active: HEAD sha, branch: HEAD branch | null,
+//   activeKey: render-cache key of the working tree, gitError: string | null }.
 
-  const existing = Object.values(ctx.state.checkpoints).find((c) => c.file === basename);
-  if (existing) return;
-  if (basename === ACTIVE_FILE) return;
-
-  const description = extractDescription(scadFile);
-  const sessionId = detectCurrentSessionId(ctx);
-
-  const id = generateId();
-  ctx.state.checkpoints[id] = {
-    file: basename,
-    parent: ctx.state.active,
-    label: path.basename(basename, '.scad').replace(/[_-]/g, ' ').substring(0, 30),
-    description,
-    sessionId,
-    created: new Date().toISOString(),
-  };
-
-  ctx.state.active = id;
-  saveState(ctx);
-  copyToActive(ctx, basename);
-  sendCheckpoints(ctx);
-  sendFileContent(ctx, basename);
-
-  return id;
+function emptyHistory(gitError) {
+  return { checkpoints: {}, active: null, branch: null, activeKey: null, gitError };
 }
 
-function selectCheckpoint(ctx, id) {
-  if (!ctx.state.checkpoints[id]) return;
-  ctx.state.active = id;
-  saveState(ctx);
+/** Runs `fn` once every history operation queued before it on this window has settled. */
+function withHistoryLock(ctx, fn) {
+  const run = ctx.historyLock.then(fn, fn);
+  ctx.historyLock = run.catch(() => {});
+  return run;
+}
 
-  const cp = ctx.state.checkpoints[id];
-  copyToActive(ctx, cp.file);
-  sendCheckpoints(ctx);
-  sendFileContent(ctx, cp.file);
+/**
+ * (Re)binds the window to ctx.workspaceDir: workspace files, state, terminal,
+ * watcher, and git history. ctx.historyReady settles once history is loaded.
+ */
+function activateWorkspace(ctx) {
+  clearTimeout(ctx.commitTimer);
+  ctx.commitTimer = null;
+  ctx.git = null;
+  ctx.history = emptyHistory(null);
+  initWorkspace(ctx);
+  loadState(ctx);
+  startTerminal(ctx);
+  startFileWatcher(ctx);
+  ctx.historyReady = initHistory(ctx);
+  if (ctx.window) ctx.window.setTitle(`ClawSCAD — ${ctx.workspaceDir}`);
+}
 
-  const scadPath = path.join(ctx.workspaceDir, cp.file);
-  const tmfPath = scadPath.replace(/\.scad$/, '.3mf');
-  const stlPath = scadToStl(scadPath);
-  if (fs.existsSync(tmfPath)) {
-    sendModel(ctx, tmfPath, '3mf');
-  } else if (fs.existsSync(stlPath)) {
-    sendModel(ctx, stlPath, 'stl');
-  } else {
-    enqueueRender(ctx, scadPath);
+/**
+ * Opens or creates the workspace repo and loads its log. Without usable git,
+ * ctx.git stays null and ctx.history.gitError says why. Never rejects.
+ */
+async function initHistory(ctx) {
+  const dir = ctx.workspaceDir;
+  seedEntryFromLegacy(dir);
+  const git = createGit(dir, { execFile });
+  let error = null;
+  try {
+    if (await git.isAvailable()) await git.ensureRepo(GITIGNORE_LINES, 'Initialize ClawSCAD workspace');
+    else error = 'git was not found on PATH — install git to enable history';
+  } catch (err) {
+    error = `git: ${err.message}`;
+  }
+  if (ctx.workspaceDir !== dir) return;
+  if (error) {
+    ctx.history = emptyHistory(error);
+    return;
+  }
+  ctx.git = git;
+  try {
+    await refreshHistory(ctx);
+  } catch (err) {
+    ctx.history = emptyHistory(`git: ${err.message}`);
   }
 }
 
-function copyToActive(ctx, scadFilename) {
-  const src = path.join(ctx.workspaceDir, scadFilename);
-  const dst = path.join(ctx.workspaceDir, ACTIVE_FILE);
-  try { fs.copyFileSync(src, dst); } catch {}
+// A workspace from the file-per-version workflow continues from its selected checkpoint.
+function seedEntryFromLegacy(dir) {
+  const entry = path.join(dir, ENTRY_FILE);
+  const legacy = path.join(dir, LEGACY_ACTIVE_FILE);
+  try {
+    if (!fs.existsSync(entry) && fs.existsSync(legacy)) fs.copyFileSync(legacy, entry);
+  } catch {}
+}
+
+/** Reloads the git log into ctx.history and pushes it to the renderer. */
+async function refreshHistory(ctx) {
+  const git = ctx.git;
+  if (!git) return;
+  const entries = await git.log();
+  const head = await git.head();
+  const branches = await git.localBranches();
+  if (ctx.git !== git) return;
+
+  const branchesAt = {};
+  for (const [name, sha] of Object.entries(branches)) (branchesAt[sha] ||= []).push(name);
+  const checkpoints = {};
+  for (const [order, e] of entries.entries()) {
+    checkpoints[e.sha] = {
+      sha: e.sha,
+      order,
+      parent: e.parents[0] || null,
+      subject: e.subject,
+      label: ctx.state.labels[e.sha] || e.subject,
+      description: e.body || e.subject,
+      sessionId: e.sessionId,
+      created: e.date,
+      refs: e.refs,
+      branches: branchesAt[e.sha] || [],
+      file: ENTRY_FILE,
+    };
+  }
+  ctx.history = {
+    checkpoints,
+    active: head.sha,
+    branch: head.branch,
+    activeKey: modelKey(ctx.workspaceDir, ENTRY_FILE),
+    gitError: null,
+  };
+  sendCheckpoints(ctx);
+}
+
+/** Debounces an auto-commit after file changes; errors surface as `git:error` toasts. */
+function scheduleCommit(ctx) {
+  if (!ctx.git) return;
+  clearTimeout(ctx.commitTimer);
+  ctx.commitTimer = setTimeout(() => {
+    ctx.commitTimer = null;
+    withHistoryLock(ctx, () => autoCommit(ctx)).catch((err) => reportGitError(ctx, err));
+  }, COMMIT_DEBOUNCE_MS);
+}
+
+/**
+ * Commits all pending workspace changes; no-op when clean. A detached HEAD
+ * (editing from an older commit) first gets a new `clawscad/<timestamp>` branch.
+ * Subject = first-line comment of ENTRY_FILE, unless it repeats HEAD's subject.
+ * Caller must hold the history lock.
+ */
+async function autoCommit(ctx) {
+  const git = ctx.git;
+  if (!git || !(await git.isDirty())) return;
+  const head = await git.head();
+  if (head.sha && !head.branch) await git.createBranch(newBranchName());
+  const fallback = `Update ${ENTRY_FILE}`;
+  let subject = extractDescription(path.join(ctx.workspaceDir, ENTRY_FILE)) || fallback;
+  const previous = head.sha && ctx.history.checkpoints[head.sha];
+  if (previous && previous.subject === subject) subject = fallback;
+  await git.commitAll(subject, { sessionId: detectCurrentSessionId(ctx) });
+  await refreshHistory(ctx);
+}
+
+function newBranchName() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `clawscad/${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+/**
+ * Commits pending work, then checks out `sha`: by branch name when a local branch
+ * points at it (HEAD stays attached), otherwise as a detached HEAD.
+ * Unknown SHAs are ignored. Rejects with GitError if the checkout fails.
+ */
+async function selectCheckpoint(ctx, sha) {
+  await withHistoryLock(ctx, async () => {
+    const git = ctx.git;
+    if (!git || !ctx.history.checkpoints[sha]) return;
+    clearTimeout(ctx.commitTimer);
+    ctx.commitTimer = null;
+    await autoCommit(ctx);
+    const head = await git.head();
+    const atSha = Object.entries(await git.localBranches()).filter(([, tip]) => tip === sha).map(([name]) => name);
+    const target = atSha.includes(head.branch) ? head.branch : atSha[0] || sha;
+    if (target !== (head.branch || head.sha)) await git.checkout(target);
+    await refreshHistory(ctx);
+  });
+  showCurrentModel(ctx);
+}
+
+/**
+ * Deletes every local branch whose tip is `sha`, except the checked-out one.
+ * @returns {Promise<string[]>} deleted branch names (empty if none qualified).
+ */
+function deleteBranchesAt(ctx, sha) {
+  return withHistoryLock(ctx, async () => {
+    const git = ctx.git;
+    if (!git) return [];
+    const head = await git.head();
+    const names = Object.entries(await git.localBranches())
+      .filter(([name, tip]) => tip === sha && name !== head.branch)
+      .map(([name]) => name);
+    for (const name of names) await git.deleteBranch(name);
+    await refreshHistory(ctx);
+    return names;
+  });
+}
+
+function reportGitError(ctx, err) {
+  ctxSend(ctx, 'git:error', { message: err.message });
 }
 
 function sendCheckpoints(ctx) {
-  ctxSend(ctx, 'checkpoint:update', ctx.state);
+  ctxSend(ctx, 'checkpoint:update', ctx.history);
+}
+
+// ── Render Cache ────────────────────────────────────────────────────────
+// Renders are cached in CACHE_DIR by content, so revisiting any commit whose
+// sources were rendered before needs no OpenSCAD run.
+
+function isSourceName(name) {
+  return name.endsWith('.scad') && name !== LEGACY_ACTIVE_FILE;
+}
+
+/**
+ * Cache key for rendering `entry` given the top-level .scad files it may include.
+ * Files in subdirectories are not part of the key.
+ * @param {[string, string][]} files [name, text] pairs.
+ */
+function hashSources(entry, files) {
+  const hash = crypto.createHash('sha1');
+  hash.update(`${entry}\0`);
+  const sorted = [...files].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  for (const [name, text] of sorted) hash.update(`${name}\0${text}\0`);
+  return hash.digest('hex');
+}
+
+/** hashSources over the current files in `dir`; null if `dir` is unreadable. */
+function modelKey(dir, entry) {
+  try {
+    const names = fs.readdirSync(dir).filter(isSourceName);
+    return hashSources(entry, names.map((n) => [n, fs.readFileSync(path.join(dir, n), 'utf-8')]));
+  } catch {
+    return null;
+  }
+}
+
+function cachePath(ctx, key, format) {
+  return path.join(ctx.workspaceDir, CACHE_DIR, `${key}.${format}`);
+}
+
+/** Cached render for `key` as {path, format}, preferring 3MF; null on a miss. */
+function findCachedModel(ctx, key) {
+  if (!key) return null;
+  for (const format of ['3mf', 'stl']) {
+    const p = cachePath(ctx, key, format);
+    if (fs.existsSync(p)) return { path: p, format };
+  }
+  return null;
+}
+
+function storeCachedModel(ctx, key, outputPath, format) {
+  if (!key) return;
+  try {
+    fs.mkdirSync(path.join(ctx.workspaceDir, CACHE_DIR), { recursive: true });
+    fs.copyFileSync(outputPath, cachePath(ctx, key, format));
+  } catch {}
+}
+
+function readParts(scadPath) {
+  try { return parseTopLevelParts(fs.readFileSync(scadPath, 'utf-8')); } catch { return []; }
+}
+
+/** Shows ENTRY_FILE in the editor and the viewer, from the cache or via a queued render. */
+function showCurrentModel(ctx) {
+  const entryPath = path.join(ctx.workspaceDir, ENTRY_FILE);
+  if (!fs.existsSync(entryPath)) return;
+  sendFileContent(ctx, ENTRY_FILE);
+  const key = modelKey(ctx.workspaceDir, ENTRY_FILE);
+  const cached = findCachedModel(ctx, key);
+  if (cached) sendModel(ctx, cached.path, cached.format, { modelKey: key, parts: readParts(entryPath) });
+  else enqueueRender(ctx, entryPath);
 }
 
 // ── Render Queue ────────────────────────────────────────────────────────
@@ -564,14 +769,28 @@ function processRenderQueue(ctx) {
   if (ctx.isRendering || ctx.renderQueue.length === 0) return;
   ctx.isRendering = true;
   const scadPath = ctx.renderQueue.shift();
+  // Key and parts are captured before rendering so later edits can't mislabel this output.
+  const key = modelKey(path.dirname(scadPath), path.basename(scadPath));
+  const parts = readParts(scadPath);
+  const cached = findCachedModel(ctx, key);
+  if (cached) {
+    ctx.isRendering = false;
+    sendModel(ctx, cached.path, cached.format, { modelKey: key, parts });
+    processRenderQueue(ctx);
+    return;
+  }
   // A 3MF failure affects only this file; later models still retain colour.
   const format = ctx.stlFallbackFor === scadPath ? 'stl' : '3mf';
   const outputExt = format === '3mf' ? '.3mf' : '.stl';
   const outputPath = scadPath.replace(/\.scad$/, outputExt);
+  // lazy-union keeps each top-level statement a separate 3MF object (one viewer part each).
+  const args = format === '3mf'
+    ? ['-o', outputPath, '--enable=lazy-union', scadPath]
+    : ['-o', outputPath, scadPath];
 
   ctxSend(ctx, 'render:start', { file: path.basename(scadPath) });
 
-  execFile(OPENSCAD_BIN, ['-o', outputPath, scadPath], { timeout: 120000, env: openscadEnv() }, (err, stdout, stderr) => {
+  execFile(OPENSCAD_BIN, args, { timeout: 120000, env: openscadEnv() }, (err, stdout, stderr) => {
     ctx.isRendering = false;
 
     const fault = classifyRenderFailure(err, outputPath);
@@ -598,7 +817,8 @@ function processRenderQueue(ctx) {
       if (stderr && stderr.includes('WARNING')) {
         ctxSend(ctx, 'render:warning', { file: path.basename(scadPath), warnings: stderr });
       }
-      sendModel(ctx, outputPath, format);
+      storeCachedModel(ctx, key, outputPath, format);
+      sendModel(ctx, outputPath, format, { modelKey: key, parts });
       ctxSend(ctx, 'render:complete', { file: path.basename(scadPath) });
       clearRenderErrors(ctx);
     }
@@ -640,7 +860,7 @@ function writeRenderErrors(ctx, filename, errorText, errors) {
     errFile,
     `# Render Failed: ${filename}\n\n` +
       `The last render of \`${filename}\` failed with errors.\n` +
-      `**Create a NEW fixed .scad file** (never modify the broken one).\n\n` +
+      `**Fix \`${filename}\` in place** — ClawSCAD re-renders it on save.\n\n` +
       `## Errors\n${errorLines || errorText}\n\n` +
       `## Raw Output\n\`\`\`\n${errorText.substring(0, 2000)}\n\`\`\`\n`
   );
@@ -650,7 +870,7 @@ function writeRenderErrors(ctx, filename, errorText, errors) {
     // Only nudge if Claude seems idle (don't interrupt mid-generation)
     // Write to pty so it appears in the conversation as user input
     const nudge =
-      `The render of ${filename} failed. Read RENDER_ERRORS.md for details and create a fixed version.\n`;
+      `The render of ${filename} failed. Read RENDER_ERRORS.md for details and fix ${filename}.\n`;
     // Small delay to avoid interrupting Claude mid-output
     setTimeout(() => {
       if (ctx.ptyProcess) ctx.ptyProcess.write(nudge);
@@ -667,14 +887,21 @@ function scadToStl(scadPath) {
   return scadPath.replace(/\.scad$/, '.stl');
 }
 
-function sendModel(ctx, filePath, format) {
+/**
+ * Sends a rendered model to the viewer.
+ * @param {{modelKey?: string|null, parts?: {label: string, repeated: boolean}[]}} [meta]
+ *   modelKey: render-cache key, used by the renderer as its in-memory cache id;
+ *   parts: top-level statements of the source, for naming 3MF objects.
+ */
+function sendModel(ctx, filePath, format, { modelKey = null, parts = [] } = {}) {
   try {
     const data = fs.readFileSync(filePath);
     ctxSend(ctx, 'model:update', {
       data,
       path: filePath,
       format: format || 'stl',
-      checkpointId: ctx.state.active,
+      modelKey,
+      parts,
     });
   } catch {}
 }
@@ -807,28 +1034,13 @@ function startFileWatcher(ctx) {
   });
 }
 
+// Any .scad change (entry or an included helper) re-renders ENTRY_FILE and
+// schedules a commit. Checkouts trigger this too; the commit is then a no-op.
 function handleFileEvent(ctx, filePath) {
-  const ext = path.extname(filePath).toLowerCase();
   const basename = path.basename(filePath);
-  if (basename === ACTIVE_FILE) return;
-
-  if (ext === '.scad') {
-    const id = addCheckpoint(ctx, filePath);
-    if (id) {
-      enqueueRender(ctx, filePath);
-    } else {
-      const activeCp = ctx.state.active && ctx.state.checkpoints[ctx.state.active];
-      if (activeCp && activeCp.file === basename) {
-        enqueueRender(ctx, filePath);
-      }
-    }
-  } else if (ext === '.stl') {
-    const scadName = basename.replace(/\.stl$/, '.scad');
-    const activeCp = ctx.state.active && ctx.state.checkpoints[ctx.state.active];
-    if (activeCp && activeCp.file === scadName) {
-      sendModel(ctx, filePath, 'stl');
-    }
-  }
+  if (path.extname(basename).toLowerCase() !== '.scad' || basename === LEGACY_ACTIVE_FILE) return;
+  showCurrentModel(ctx);
+  scheduleCommit(ctx);
 }
 
 // ── IPC Handlers ────────────────────────────────────────────────────────
@@ -897,7 +1109,12 @@ ipcMain.handle('file:save', (_, filePath, content) => {
 
 ipcMain.handle('checkpoint:list', (event) => {
   const ctx = getCtx(event);
-  return ctx ? ctx.state : { checkpoints: {}, active: null };
+  return ctx ? ctx.history : emptyHistory(null);
+});
+
+ipcMain.handle('checkpoint:refresh', async (event) => {
+  const ctx = getCtx(event);
+  if (ctx) await refreshHistory(ctx).catch((err) => reportGitError(ctx, err));
 });
 
 ipcMain.handle('sessions:list', (event) => {
@@ -920,15 +1137,15 @@ ipcMain.handle('sessions:resume', (event, sessionId) => {
   if (ctx) restartTerminal(ctx, ['--resume', sessionId]);
 });
 
-ipcMain.handle('checkpoint:select', (event, id) => {
+ipcMain.handle('checkpoint:select', async (event, id) => {
   const ctx = getCtx(event);
-  if (ctx) selectCheckpoint(ctx, id);
+  if (ctx) await selectCheckpoint(ctx, id).catch((err) => reportGitError(ctx, err));
 });
 
 ipcMain.handle('checkpoint:restore-session', (event, id) => {
   const ctx = getCtx(event);
   if (!ctx) return false;
-  const cp = ctx.state.checkpoints[id];
+  const cp = ctx.history.checkpoints[id];
   if (cp && cp.sessionId) {
     restartTerminal(ctx, ['--resume', cp.sessionId]);
     return true;
@@ -936,26 +1153,64 @@ ipcMain.handle('checkpoint:restore-session', (event, id) => {
   return false;
 });
 
+// Display-only rename; commit messages are never rewritten.
 ipcMain.handle('checkpoint:rename', (event, id, label) => {
   const ctx = getCtx(event);
-  if (ctx && ctx.state.checkpoints[id]) {
-    ctx.state.checkpoints[id].label = label;
+  if (ctx && ctx.history.checkpoints[id]) {
+    ctx.state.labels[id] = label;
+    ctx.history.checkpoints[id].label = label;
     saveState(ctx);
     sendCheckpoints(ctx);
   }
 });
 
-ipcMain.handle('checkpoint:delete', (event, id) => {
+ipcMain.handle('checkpoint:delete', async (event, id) => {
   const ctx = getCtx(event);
-  if (!ctx || !ctx.state.checkpoints[id]) return;
-  const parentId = ctx.state.checkpoints[id].parent;
-  for (const [, cp] of Object.entries(ctx.state.checkpoints)) {
-    if (cp.parent === id) cp.parent = parentId;
+  if (!ctx) return [];
+  return deleteBranchesAt(ctx, id).catch((err) => {
+    reportGitError(ctx, err);
+    return [];
+  });
+});
+
+// Source and cached render of a commit, without touching the working tree.
+ipcMain.handle('checkpoint:get', async (event, id) => {
+  const ctx = getCtx(event);
+  if (!ctx || !ctx.git || !ctx.history.checkpoints[id]) return null;
+  try {
+    const names = (await ctx.git.listFiles(id)).filter(isSourceName);
+    const files = [];
+    for (const name of names) files.push([name, await ctx.git.showFile(id, name)]);
+    const source = (files.find(([name]) => name === ENTRY_FILE) || [])[1] ?? null;
+    const cached = findCachedModel(ctx, hashSources(ENTRY_FILE, files));
+    return {
+      file: ENTRY_FILE,
+      source,
+      data: cached ? fs.readFileSync(cached.path) : null,
+      format: cached ? cached.format : null,
+      parts: source ? parseTopLevelParts(source) : [],
+    };
+  } catch (err) {
+    reportGitError(ctx, err);
+    return null;
   }
-  delete ctx.state.checkpoints[id];
-  if (ctx.state.active === id) ctx.state.active = parentId;
-  saveState(ctx);
-  sendCheckpoints(ctx);
+});
+
+ipcMain.handle('git:push', async (event) => {
+  const ctx = getCtx(event);
+  if (!ctx || !ctx.git) return { error: ctx && ctx.history.gitError ? ctx.history.gitError : 'git is not available' };
+  try {
+    await withHistoryLock(ctx, async () => {
+      clearTimeout(ctx.commitTimer);
+      ctx.commitTimer = null;
+      await autoCommit(ctx);
+      await ctx.git.push();
+    });
+    await refreshHistory(ctx);
+    return { ok: true };
+  } catch (err) {
+    return { error: err.message };
+  }
 });
 
 // ── MCP Direct Access ───────────────────────────────────────────────────
@@ -983,19 +1238,32 @@ ipcMain.handle('mcp:status', async () => {
 ipcMain.handle('render:force', (event) => {
   const ctx = getCtx(event);
   if (!ctx) return;
-  const cp = ctx.state.active && ctx.state.checkpoints[ctx.state.active];
-  if (cp) {
-    const scadPath = path.join(ctx.workspaceDir, cp.file);
-    if (fs.existsSync(scadPath)) {
-      // Delete stale output so it re-renders fresh
-      const stlPath = scadToStl(scadPath);
-      const tmfPath = scadPath.replace(/\.scad$/, '.3mf');
-      try { if (fs.existsSync(stlPath)) fs.unlinkSync(stlPath); } catch {}
-      try { if (fs.existsSync(tmfPath)) fs.unlinkSync(tmfPath); } catch {}
-      enqueueRender(ctx, scadPath);
-    }
+  const scadPath = path.join(ctx.workspaceDir, ENTRY_FILE);
+  if (!fs.existsSync(scadPath)) return;
+  // Drop the cached and stale outputs so it re-renders fresh
+  const key = modelKey(ctx.workspaceDir, ENTRY_FILE);
+  const stale = [scadToStl(scadPath), scadPath.replace(/\.scad$/, '.3mf')];
+  if (key) stale.push(cachePath(ctx, key, '3mf'), cachePath(ctx, key, 'stl'));
+  for (const p of stale) {
+    try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch {}
   }
+  enqueueRender(ctx, scadPath);
 });
+
+/** Commits pending work of the current workspace, then rebinds the window to `dir`. */
+async function switchWorkspace(ctx, dir) {
+  clearTimeout(ctx.commitTimer);
+  ctx.commitTimer = null;
+  await withHistoryLock(ctx, () => autoCommit(ctx)).catch(() => {});
+  if (ctx.fileWatcher) ctx.fileWatcher.close();
+  if (ctx.ptyProcess) try { ctx.ptyProcess.kill(); } catch {}
+  ctx.workspaceDir = dir;
+  activateWorkspace(ctx);
+  updateAllClaudeMd();
+  await ctx.historyReady;
+  sendCheckpoints(ctx);
+  showCurrentModel(ctx);
+}
 
 ipcMain.handle('app:new-project-window', async (event) => {
   if (windows.size >= MAX_WINDOWS) return null;
@@ -1026,17 +1294,7 @@ ipcMain.handle('app:open-workspace', async (event) => {
     title: 'Open Workspace',
   });
   if (!result.canceled && result.filePaths[0]) {
-    // Replace this window's workspace
-    if (ctx.fileWatcher) ctx.fileWatcher.close();
-    if (ctx.ptyProcess) try { ctx.ptyProcess.kill(); } catch {}
-    ctx.workspaceDir = result.filePaths[0];
-    initWorkspace(ctx);
-    loadState(ctx);
-    startTerminal(ctx);
-    startFileWatcher(ctx);
-    ctx.window.setTitle(`ClawSCAD — ${ctx.workspaceDir}`);
-    sendCheckpoints(ctx);
-    updateAllClaudeMd();
+    await switchWorkspace(ctx, result.filePaths[0]);
     return ctx.workspaceDir;
   }
   return null;
@@ -1055,9 +1313,7 @@ ipcMain.handle('app:get-print-settings-path', (event) => {
 ipcMain.handle('app:export', async (event, format) => {
   const ctx = getCtx(event);
   if (!ctx) return null;
-  const cp = ctx.state.active && ctx.state.checkpoints[ctx.state.active];
-  if (!cp) return null;
-  const scadPath = path.join(ctx.workspaceDir, cp.file);
+  const scadPath = path.join(ctx.workspaceDir, ENTRY_FILE);
   if (!fs.existsSync(scadPath)) return null;
 
   const filters = {
@@ -1066,7 +1322,7 @@ ipcMain.handle('app:export', async (event, format) => {
     png: [{ name: 'PNG Image', extensions: ['png'] }],
   };
   const ext = format === 'png' ? '.png' : format === '3mf' ? '.3mf' : '.stl';
-  const defaultName = cp.file.replace(/\.scad$/, ext);
+  const defaultName = ENTRY_FILE.replace(/\.scad$/, ext);
 
   const result = await dialog.showSaveDialog(ctx.window, {
     title: `Export as ${format.toUpperCase()}`,
@@ -1075,9 +1331,12 @@ ipcMain.handle('app:export', async (event, format) => {
   });
   if (result.canceled) return null;
 
+  // 3MF keeps top-level parts as separate objects, so slicers can arrange them individually.
   const args = format === 'png'
     ? ['--imgsize=1920,1080', '-o', result.filePath, scadPath]
-    : ['-o', result.filePath, scadPath];
+    : format === '3mf'
+      ? ['-o', result.filePath, '--enable=lazy-union', scadPath]
+      : ['-o', result.filePath, scadPath];
 
   return new Promise((resolve) => {
     execFile(OPENSCAD_BIN, args, { timeout: 120000, env: openscadEnv() }, (err, stdout, stderr) => {
@@ -1142,24 +1401,16 @@ ipcMain.handle('app:open-path', async (event, inputPath) => {
   try {
     const stat = fs.statSync(inputPath);
     if (stat.isDirectory()) {
-      // Switch workspace to this directory
-      if (ctx.fileWatcher) ctx.fileWatcher.close();
-      if (ctx.ptyProcess) try { ctx.ptyProcess.kill(); } catch {}
-      ctx.workspaceDir = inputPath;
-      initWorkspace(ctx);
-      loadState(ctx);
-      startTerminal(ctx);
-      startFileWatcher(ctx);
-      ctx.window.setTitle(`ClawSCAD — ${ctx.workspaceDir}`);
-      sendCheckpoints(ctx);
-      updateAllClaudeMd();
+      await switchWorkspace(ctx, inputPath);
       addRecentPath(inputPath);
       return { type: 'workspace', path: inputPath };
     } else if (stat.isFile() && inputPath.endsWith('.scad')) {
-      // Copy the .scad file into the workspace and add as checkpoint
-      const basename = path.basename(inputPath);
-      const dest = path.join(ctx.workspaceDir, basename);
-      if (!fs.existsSync(dest)) fs.copyFileSync(inputPath, dest);
+      // Imported source replaces the model; the previous version stays in git history.
+      clearTimeout(ctx.commitTimer);
+      ctx.commitTimer = null;
+      await withHistoryLock(ctx, () => autoCommit(ctx)).catch(() => {});
+      const dest = path.join(ctx.workspaceDir, ENTRY_FILE);
+      fs.copyFileSync(inputPath, dest);
       return { type: 'file', path: dest };
     }
   } catch {}

@@ -35,7 +35,13 @@ contextBridge.exposeInMainWorld('api', {
   deleteCheckpoint: (id) => ipcRenderer.invoke('checkpoint:delete', id),
   renameCheckpoint: (id, label) => ipcRenderer.invoke('checkpoint:rename', id, label),
   restoreCheckpointSession: (id) => ipcRenderer.invoke('checkpoint:restore-session', id),
+  getCheckpoint: (id) => ipcRenderer.invoke('checkpoint:get', id),
+  refreshCheckpoints: () => ipcRenderer.invoke('checkpoint:refresh'),
   onCheckpointUpdate: (cb) => ipcRenderer.on('checkpoint:update', (_, data) => cb(data)),
+
+  // Git
+  pushHistory: () => ipcRenderer.invoke('git:push'),
+  onGitError: (cb) => ipcRenderer.on('git:error', (_, data) => cb(data)),
 
   // Files
   readFile: (filePath) => ipcRenderer.invoke('file:read', filePath),

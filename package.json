@@ -9,7 +9,7 @@
     "download-openscad": "node scripts/download-openscad.js",
     "start": "npm run build:renderer && electron . --no-sandbox",
     "dev": "npm run build:renderer && electron . --dev --no-sandbox",
-    "test:backend": "node --test tests/backend-reliability.js",
+    "test:backend": "node --test tests/backend-reliability.js tests/scad-parts.js tests/git-history.js tests/history-graph.js",
     "test": "npm run test:backend && node tests/download-openscad.js && npm run build:renderer && npx playwright test",
     "test:headed": "npm run build:renderer && npx playwright test --headed",
     "pack": "npm run download-openscad && npm run build:renderer && electron-builder --dir",
@@ -46,6 +46,8 @@
     "artifactName": "${productName}-${version}.${ext}",
     "files": [
       "main.js",
+      "git.js",
+      "scad-parts.js",
       "preload.js",
       "index.html",
       "style.css",

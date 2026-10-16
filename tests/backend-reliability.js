@@ -37,13 +37,15 @@ function loadBackend(overrides = {}) {
     ...overrides,
   };
   const context = vm.createContext({
-    require: (name) => mocks[name] || require(name),
+    require: (name) => mocks[name] || require(name.startsWith('./') ? path.join(appRoot, name) : name),
     __dirname: appRoot,
     process: { env: {}, platform: process.platform, argv: [] },
     console: { error: (...args) => logs.push(args), warn: (...args) => logs.push(args) },
     setTimeout: (callback, ms) => { timers.push({ callback, ms }); return timers.length; },
+    clearTimeout: () => {},
   });
-  vm.runInContext(source + '\n;globalThis.backend = { McpClient, writeClaudeMd, startFileWatcher, processRenderQueue };', context);
+  vm.runInContext(source + '\n;globalThis.backend = { McpClient, writeClaudeMd, startFileWatcher, processRenderQueue,'
+    + ' initHistory, autoCommit, selectCheckpoint, withHistoryLock, emptyHistory };', context);
   return { ...context.backend, renders, children, timers, logs, watcher };
 }
 
@@ -211,4 +213,81 @@ test('a genuine model error retains the existing error report and Claude repair 
   assert.equal(backend.timers.length, 1);
   assert.equal(ctx.messages.find((m) => m.channel === 'render:error').data.fault, 'model');
   assert.equal(ctx.stlFallbackFor, null);
+});
+
+test('3MF renders use lazy-union, carry part names, and identical sources hit the cache', (t) => {
+  const backend = loadBackend();
+  const dir = workspace(t);
+  fs.writeFileSync(path.join(dir, 'model.scad'), 'base();\nlid();');
+  const ctx = renderContext(dir, ['model.scad']);
+  backend.processRenderQueue(ctx);
+  assert.ok(backend.renders[0].args.includes('--enable=lazy-union'));
+  completeRender(backend.renders[0]);
+
+  ctx.renderQueue.push(path.join(dir, 'model.scad'));
+  backend.processRenderQueue(ctx);
+  assert.equal(backend.renders.length, 1);
+  const updates = ctx.messages.filter((m) => m.channel === 'model:update').map((m) => m.data);
+  assert.equal(updates.length, 2);
+  assert.match(updates[0].modelKey, /^[0-9a-f]{40}$/);
+  assert.equal(updates[1].modelKey, updates[0].modelKey);
+  assert.deepEqual(updates[1].parts.map((p) => p.label), ['base', 'lid']);
+
+  fs.writeFileSync(path.join(dir, 'model.scad'), 'base();');
+  ctx.renderQueue.push(path.join(dir, 'model.scad'));
+  backend.processRenderQueue(ctx);
+  assert.equal(backend.renders.length, 2);
+});
+
+test('edits auto-commit, and editing from an older commit starts a new branch', async (t) => {
+  const realExecFile = require('node:child_process').execFile;
+  const renders = [];
+  const backend = loadBackend({ child_process: {
+    execFile: (bin, args, options, callback) => (bin === 'git'
+      ? realExecFile(bin, args, options, callback)
+      : renders.push({ bin, args, callback })),
+    spawn: () => assert.fail('unexpected spawn'),
+  } });
+  const dir = workspace(t);
+  const model = path.join(dir, 'model.scad');
+  fs.writeFileSync(model, '// First cube\ncube(1);');
+  const ctx = {
+    ...renderContext(dir, []),
+    state: { labels: {} },
+    history: backend.emptyHistory(null),
+    historyLock: Promise.resolve(),
+  };
+  await backend.initHistory(ctx);
+  assert.equal(ctx.history.gitError, null);
+  const root = ctx.history.active;
+  assert.equal(ctx.history.checkpoints[root].subject, 'Initialize ClawSCAD workspace');
+  assert.match(fs.readFileSync(path.join(dir, '.gitignore'), 'utf8'), /CLAUDE\.md/);
+
+  fs.writeFileSync(model, '// Bigger cube\ncube(2);');
+  await backend.withHistoryLock(ctx, () => backend.autoCommit(ctx));
+  const main = ctx.history.branch;
+  const bigger = ctx.history.active;
+  assert.equal(ctx.history.checkpoints[bigger].subject, 'Bigger cube');
+  assert.equal(ctx.history.checkpoints[bigger].parent, root);
+
+  fs.writeFileSync(model, '// Bigger cube\ncube(3);');
+  await backend.withHistoryLock(ctx, () => backend.autoCommit(ctx));
+  assert.equal(ctx.history.checkpoints[ctx.history.active].subject, 'Update model.scad');
+
+  await backend.selectCheckpoint(ctx, bigger);
+  assert.equal(ctx.history.active, bigger);
+  assert.equal(ctx.history.branch, null);
+  assert.equal(fs.readFileSync(model, 'utf8'), '// Bigger cube\ncube(2);');
+  assert.equal(renders.length, 1);
+
+  fs.writeFileSync(model, '// Sphere instead\nsphere(2);');
+  await backend.withHistoryLock(ctx, () => backend.autoCommit(ctx));
+  const sphere = ctx.history.checkpoints[ctx.history.active];
+  assert.match(ctx.history.branch, /^clawscad\/\d{8}-\d{6}$/);
+  assert.equal(sphere.parent, bigger);
+  assert.deepEqual([...sphere.branches], [ctx.history.branch]);
+
+  const mainTip = Object.values(ctx.history.checkpoints).find((cp) => cp.branches.includes(main));
+  await backend.selectCheckpoint(ctx, mainTip.sha);
+  assert.equal(ctx.history.branch, main);
 });

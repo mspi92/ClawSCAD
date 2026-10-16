@@ -67,11 +67,11 @@ test.describe('Window & Layout', () => {
     await expect(status).toContainText('ClawSCAD');
   });
 
-  test('checkpoint panel is visible with empty state', async () => {
+  test('checkpoint panel shows the initial commit of a fresh workspace', async () => {
     const cpPanel = page.locator('#checkpoint-panel');
     await expect(cpPanel).toBeVisible();
     const tree = page.locator('#checkpoint-tree');
-    await expect(tree).toContainText('No checkpoints yet');
+    await expect(tree).toContainText('Initialize ClawSCAD workspace');
   });
 
   test('splitter is visible and has correct cursor', async () => {
@@ -283,7 +283,8 @@ test.describe('Workspace Setup', () => {
     expect(fs.existsSync(claudeMd)).toBe(true);
     const content = fs.readFileSync(claudeMd, 'utf-8');
     expect(content).toContain('MANDATORY RULES');
-    expect(content).toContain('NEVER modify or overwrite');
+    expect(content).toContain('Edit it in place');
+    expect(content).toContain('one top-level statement per independent component');
     expect(content).toContain('color()');
     expect(content).toContain('MCP Tools Available');
   });
@@ -310,50 +311,47 @@ test.describe('Workspace Setup', () => {
     expect(isBundled || isSystemFallback).toBe(true);
   });
 
-  test('clawscad.json state file format', async () => {
-    const statePath = path.join(TEST_WORKSPACE, 'clawscad.json');
-    const testScad = path.join(TEST_WORKSPACE, 'test-cube.scad');
-    fs.writeFileSync(testScad, '// Test cube\ncube([10, 10, 10]);');
-    await page.waitForTimeout(1500);
-    if (fs.existsSync(statePath)) {
-      const state = JSON.parse(fs.readFileSync(statePath, 'utf-8'));
-      expect(state).toHaveProperty('checkpoints');
-      expect(state).toHaveProperty('active');
+  test('workspace is a git repo that ignores render outputs and app files', async () => {
+    expect(fs.existsSync(path.join(TEST_WORKSPACE, '.git'))).toBe(true);
+    const ignore = fs.readFileSync(path.join(TEST_WORKSPACE, '.gitignore'), 'utf-8').split('\n');
+    for (const line of ['*.stl', '*.3mf', '.clawscad/', 'clawscad.json', 'CLAUDE.md']) {
+      expect(ignore).toContain(line);
     }
   });
 });
 
-// ── Checkpoint Creation Tests ───────────────────────────────────────
+// ── Git History Tests ───────────────────────────────────────────────
 
-test.describe('Checkpoint System', () => {
-  test('creating a .scad file adds a checkpoint', async () => {
-    const testScad = path.join(TEST_WORKSPACE, 'my-first-gear.scad');
-    fs.writeFileSync(testScad, '// A simple gear shape\ncube([20, 20, 5]);');
-    await page.waitForTimeout(1500);
-    const tree = page.locator('#checkpoint-tree');
-    await expect(tree).not.toContainText('No checkpoints yet');
-    await expect(tree).toContainText('my first gear');
+const MODEL = path.join(TEST_WORKSPACE, 'model.scad');
+// Debounced auto-commit (2 s) plus git and IPC round trips.
+const COMMIT_WAIT = { timeout: 10000 };
+
+test.describe('Git History', () => {
+  test('editing model.scad adds a commit named after its first-line comment', async () => {
+    fs.writeFileSync(MODEL, '// A simple gear shape\ncube([20, 20, 5]);');
+    await expect(page.locator('#checkpoint-tree')).toContainText('A simple gear shape', COMMIT_WAIT);
   });
 
-  test('checkpoint shows description on hover', async () => {
-    const testScad = path.join(TEST_WORKSPACE, 'hover-test-part.scad');
-    fs.writeFileSync(testScad, '// Tooltip description test\nsphere(r=5);');
-    await page.waitForTimeout(1500);
-    const node = page.locator('.cp-node').last();
+  test('commit shows description on hover', async () => {
+    fs.writeFileSync(MODEL, '// Tooltip description test\nsphere(r=5);');
+    const node = page.locator('.cp-node', { hasText: 'Tooltip description test' });
+    await expect(node).toBeVisible(COMMIT_WAIT);
     await node.hover();
-    const tooltip = page.locator('#cp-tooltip');
-    await expect(tooltip).not.toHaveClass(/hidden/);
+    await expect(page.locator('#cp-tooltip')).not.toHaveClass(/hidden/);
     await expect(page.locator('#cp-tooltip-desc')).toContainText('Tooltip description test');
   });
 
-  test('active.scad is created when checkpoint is selected', async () => {
-    const testScad = path.join(TEST_WORKSPACE, 'active-test.scad');
-    fs.writeFileSync(testScad, '// Active test\ncube(5);');
-    await page.waitForTimeout(1500);
-    const activePath = path.join(TEST_WORKSPACE, 'active.scad');
-    expect(fs.existsSync(activePath)).toBe(true);
-    const content = fs.readFileSync(activePath, 'utf-8');
-    expect(content).toContain('Active test');
+  test('clicking an older commit checks its source out', async () => {
+    await page.locator('.cp-node', { hasText: 'A simple gear shape' }).click();
+    await expect.poll(() => fs.readFileSync(MODEL, 'utf-8'), COMMIT_WAIT).toContain('A simple gear shape');
+    await expect(page.locator('.cp-node.active')).toContainText('A simple gear shape');
+  });
+
+  test('editing from an older commit starts a new branch', async () => {
+    fs.writeFileSync(MODEL, '// Branched variant\ncube([20, 20, 8]);');
+    const node = page.locator('.cp-node', { hasText: 'Branched variant' });
+    await expect(node).toBeVisible(COMMIT_WAIT);
+    await expect(node.locator('.cp-ref.head')).toContainText(/^clawscad\//);
   });
 });
 
@@ -362,6 +360,15 @@ test.describe('Checkpoint System', () => {
 // They catch regressions in binary resolution, process spawning, and model loading.
 
 test.describe('Render Pipeline', () => {
+  const scadPath = MODEL;
+
+  // Writes model.scad after removing previous outputs, so a fresh output proves a new render.
+  // Sources must differ per test: identical sources are served from the render cache.
+  function writeModel(content) {
+    for (const ext of ['.3mf', '.stl']) fs.rmSync(scadPath.replace(/\.scad$/, ext), { force: true });
+    fs.writeFileSync(scadPath, content);
+  }
+
   // Helper: poll the filesystem until an output file appears next to the .scad
   async function waitForRenderOutput(scadPath, timeoutMs = 20000) {
     const base = scadPath.replace(/\.scad$/, '');
@@ -374,16 +381,14 @@ test.describe('Render Pipeline', () => {
   }
 
   test('renders a simple sphere and produces a 3mf/stl output file', async () => {
-    const scadPath = path.join(TEST_WORKSPACE, 'pipeline-sphere.scad');
-    fs.writeFileSync(scadPath, '// Pipeline test sphere\nsphere(r=10);');
+    writeModel('// Pipeline test sphere\nsphere(r=10);');
 
     const rendered = await waitForRenderOutput(scadPath);
     expect(rendered).toBe(true);
   });
 
   test('render overlay hides after successful render', async () => {
-    const scadPath = path.join(TEST_WORKSPACE, 'pipeline-overlay.scad');
-    fs.writeFileSync(scadPath, '// Overlay test\ncube([5, 5, 5]);');
+    writeModel('// Overlay test\ncube([5, 5, 5]);');
 
     await waitForRenderOutput(scadPath);
     // Give renderer time to process the model:update IPC and hide the overlay
@@ -395,8 +400,7 @@ test.describe('Render Pipeline', () => {
   });
 
   test('renders a colored model (color() preserved in 3mf)', async () => {
-    const scadPath = path.join(TEST_WORKSPACE, 'pipeline-colored.scad');
-    fs.writeFileSync(scadPath, [
+    writeModel([
       '// Colored model test',
       'color("SteelBlue") sphere(r=8);',
     ].join('\n'));
@@ -410,8 +414,7 @@ test.describe('Render Pipeline', () => {
   });
 
   test('canvas has rendered pixels after model loads', async () => {
-    const scadPath = path.join(TEST_WORKSPACE, 'pipeline-canvas.scad');
-    fs.writeFileSync(scadPath, '// Canvas pixel test\ncylinder(h=20, r=8);');
+    writeModel('// Canvas pixel test\ncylinder(h=20, r=8);');
 
     await waitForRenderOutput(scadPath);
     await page.waitForTimeout(800); // allow three.js to render a frame
@@ -428,8 +431,7 @@ test.describe('Render Pipeline', () => {
   });
 
   test('broken .scad file creates RENDER_ERRORS.md', async () => {
-    const scadPath = path.join(TEST_WORKSPACE, 'pipeline-broken.scad');
-    fs.writeFileSync(scadPath, '// Intentionally broken\nthis_is_not_valid_openscad(');
+    writeModel('// Intentionally broken\nthis_is_not_valid_openscad(');
 
     // Wait a bit longer since error path still runs OpenSCAD to get the error
     const deadline = Date.now() + 15000;
@@ -442,23 +444,42 @@ test.describe('Render Pipeline', () => {
 
     expect(errorFileCreated).toBe(true);
     const content = fs.readFileSync(errFile, 'utf-8');
-    expect(content).toContain('pipeline-broken.scad');
-    expect(content).toContain('Create a NEW fixed .scad file');
+    expect(content).toContain('model.scad');
+    expect(content).toContain('in place');
   });
 
-  test('two sequential .scad files both render (queue works)', async () => {
-    const scad1 = path.join(TEST_WORKSPACE, 'queue-first.scad');
-    const scad2 = path.join(TEST_WORKSPACE, 'queue-second.scad');
-    fs.writeFileSync(scad1, '// First in queue\ncube(10);');
-    // Write second immediately — should queue behind first
-    fs.writeFileSync(scad2, '// Second in queue\nsphere(5);');
+  test('rapid successive edits end with the latest version shown', async () => {
+    writeModel('// First in queue\ncube(10);');
+    await page.waitForTimeout(300);
+    // Second edit lands while the first may still be rendering
+    fs.writeFileSync(scadPath, '// Second in queue\ncube([4, 5, 6]);');
 
-    const [ok1, ok2] = await Promise.all([
-      waitForRenderOutput(scad1),
-      waitForRenderOutput(scad2),
-    ]);
-    expect(ok1).toBe(true);
-    expect(ok2).toBe(true);
+    await expect(page.locator('#status')).toContainText('4.0 x 5.0 x 6.0', { timeout: 20000 });
+  });
+
+  test('top-level statements become named parts that can be hidden', async () => {
+    writeModel([
+      '// Three part assembly',
+      'module base() { cube([30, 30, 4]); }',
+      'module lid() { cube([30, 30, 2]); }',
+      'color("SteelBlue") base();',
+      'color("Gold") translate([0, 0, 10]) lid();',
+      'color("Red") translate([15, 15, 14]) cylinder(h = 5, r = 3);',
+    ].join('\n'));
+
+    const panel = page.locator('#parts-panel');
+    await expect(panel).toBeVisible({ timeout: 20000 });
+    const rows = panel.locator('.part-row');
+    await expect(rows).toHaveCount(3);
+    await expect(rows.locator('.part-name')).toHaveText(['base', 'lid', 'cylinder']);
+
+    const lid = rows.nth(1);
+    await lid.locator('.part-eye').click();
+    await expect(lid).toHaveClass(/part-hidden/);
+    await expect(page.locator('#parts-count')).toHaveText('2/3');
+
+    await page.locator('#parts-show-all').click();
+    await expect(page.locator('#parts-count')).toHaveText('3/3');
   });
 });
 

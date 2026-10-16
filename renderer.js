@@ -6,6 +6,8 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { ThreeMFLoader } from 'three/addons/loaders/3MFLoader.js';
 import * as monaco from 'monaco-editor/esm/vs/editor/editor.api.js';
+import { resolvePartNames } from './scad-parts.js';
+import { layoutHistory } from './history-graph.js';
 
 // ── Toast System ────────────────────────────────────────────────────────
 
@@ -180,6 +182,8 @@ editorSaveBtn.addEventListener('click', async () => {
 
 // Receive file content from main process
 window.api.onFileContent((data) => {
+  // The watcher echoes every save; resetting identical content would jump the cursor.
+  if (data.path === currentEditorFile && data.content === monacoEditor.getValue()) return;
   currentEditorFile = data.path;
   editorFilename.textContent = data.name;
   monacoEditor.setValue(data.content);
@@ -386,13 +390,13 @@ scene.add(rimLight);
 
 let currentMesh = null;
 let currentEdges = null;
-let currentCheckpointId = null;
+let currentModelKey = null;
 let edgesVisible = true;
 let wireframeMode = false;
 let modelBounds = null;
 const stlLoader = new STLLoader();
 
-// Cache: checkpointId → { mesh, edges, bounds }
+// Cache: model key (content hash of the sources, from the main process) → { mesh, edges, bounds }
 // Keeps all previously loaded models in memory for instant switching.
 // Typical STL = a few MB of geometry — even 100 checkpoints is fine.
 const modelCache = new Map();
@@ -419,8 +423,8 @@ function removeCurrentFromScene() {
   modelBounds = null;
 }
 
-function showCachedModel(checkpointId) {
-  const cached = modelCache.get(checkpointId);
+function showCachedModel(modelKey) {
+  const cached = modelCache.get(modelKey);
   if (!cached) return false;
 
   removeCurrentFromScene();
@@ -428,7 +432,7 @@ function showCachedModel(checkpointId) {
   currentMesh = cached.mesh;
   currentEdges = cached.edges;
   modelBounds = cached.bounds;
-  currentCheckpointId = checkpointId;
+  currentModelKey = modelKey;
 
   // Apply current display state
   currentMesh.visible = true;
@@ -437,6 +441,8 @@ function showCachedModel(checkpointId) {
 
   scene.add(currentMesh);
   if (currentEdges) scene.add(currentEdges);
+  applyPartVisibility();
+  renderPartsPanel();
 
   fitCameraToModel();
   updateStatus(
@@ -498,22 +504,30 @@ function validateAndRepairGeometry(geometry) {
   return issues;
 }
 
-function loadSTL(buffer, checkpointId) {
+/**
+ * Exact bytes of a view as a standalone ArrayBuffer. IPC delivers Node Buffers as
+ * Uint8Array views; small files come from Node's shared buffer pool, so `.buffer`
+ * would include unrelated bytes around the file.
+ */
+function toArrayBuffer(buffer) {
+  if (!ArrayBuffer.isView(buffer)) return buffer;
+  return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+}
+
+function loadSTL(buffer, modelKey) {
   removeCurrentFromScene();
 
-  // If re-rendering an existing checkpoint, dispose old cached geometry
-  if (checkpointId && modelCache.has(checkpointId)) {
-    const old = modelCache.get(checkpointId);
+  // If re-rendering an existing model, dispose old cached geometry
+  if (modelKey && modelCache.has(modelKey)) {
+    const old = modelCache.get(modelKey);
     if (old.mesh) old.mesh.geometry.dispose();
     if (old.edges) old.edges.geometry.dispose();
-    modelCache.delete(checkpointId);
+    modelCache.delete(modelKey);
   }
 
   let geometry;
   try {
-    geometry = stlLoader.parse(
-      buffer instanceof Uint8Array ? buffer.buffer : buffer
-    );
+    geometry = stlLoader.parse(toArrayBuffer(buffer));
   } catch (err) {
     showToast(`Failed to parse STL: ${err.message}`, 'error');
     return;
@@ -555,11 +569,12 @@ function loadSTL(buffer, checkpointId) {
     maxDim: Math.max(size.x, size.y, size.z),
   };
 
-  currentCheckpointId = checkpointId;
+  currentModelKey = modelKey;
+  renderPartsPanel();
 
   // Cache it
-  if (checkpointId) {
-    modelCache.set(checkpointId, {
+  if (modelKey) {
+    modelCache.set(modelKey, {
       mesh: currentMesh,
       edges: currentEdges,
       bounds: { ...modelBounds },
@@ -579,18 +594,29 @@ function loadSTL(buffer, checkpointId) {
 
 const threeMFLoader = new ThreeMFLoader();
 
-function load3MF(buffer, checkpointId) {
+/**
+ * @param {Uint8Array|ArrayBuffer} buffer 3MF file bytes.
+ * @param {string|null} modelKey in-memory cache id; null skips caching.
+ * @param {{label: string, repeated: boolean}[]} [parts] top-level statements of the
+ *   source, used to name the group's children (one per 3MF object).
+ */
+function load3MF(buffer, modelKey, parts = []) {
   removeCurrentFromScene();
 
   // Dispose old cache entry if re-rendering
-  if (checkpointId && modelCache.has(checkpointId)) {
-    disposeCacheEntry(modelCache.get(checkpointId));
-    modelCache.delete(checkpointId);
+  if (modelKey && modelCache.has(modelKey)) {
+    disposeCacheEntry(modelCache.get(modelKey));
+    modelCache.delete(modelKey);
   }
 
-  const group = threeMFLoader.parse(
-    buffer instanceof Uint8Array ? buffer.buffer : buffer
-  );
+  let group;
+  try {
+    group = threeMFLoader.parse(toArrayBuffer(buffer));
+  } catch (err) {
+    showToast(`Failed to parse 3MF: ${err.message}`, 'error');
+    return;
+  }
+  nameParts(group, parts);
 
   // Center the group
   const box = new THREE.Box3().setFromObject(group);
@@ -639,10 +665,12 @@ function load3MF(buffer, checkpointId) {
     maxDim: Math.max(size.x, size.y, size.z),
   };
 
-  currentCheckpointId = checkpointId;
+  currentModelKey = modelKey;
+  applyPartVisibility();
+  renderPartsPanel();
 
-  if (checkpointId) {
-    modelCache.set(checkpointId, {
+  if (modelKey) {
+    modelCache.set(modelKey, {
       mesh: currentMesh,
       edges: null,
       bounds: { ...modelBounds },
@@ -1037,11 +1065,11 @@ window.api.onModelUpdate((update) => {
       update.data instanceof Uint8Array
         ? update.data
         : new Uint8Array(update.data);
-    const cpId = update.checkpointId || null;
+    const key = update.modelKey || null;
     if (update.format === '3mf') {
-      load3MF(bytes, cpId);
+      load3MF(bytes, key, update.parts);
     } else {
-      loadSTL(bytes, cpId);
+      loadSTL(bytes, key);
     }
   }
 });
@@ -1050,77 +1078,103 @@ window.api.onModelUpdate((update) => {
 
 const treeEl = document.getElementById('checkpoint-tree');
 let checkpointState = { checkpoints: {}, active: null };
-const collapsedNodes = new Set(); // checkpoint IDs whose children are hidden
 let contextMenuTargetId = null;
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const LANE_W = 12;
+const ROW_H = 24; // must match .cp-node height so lanes connect across rows
+const LANE_COLORS = ['#4488ff', '#44cc77', '#cc77ff', '#ffaa44', '#44cccc', '#ff6688'];
+
+/** Lane-column SVG for one `layoutHistory` row, `laneCount` lanes wide. */
+function createGraphCell(row, laneCount) {
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('class', 'cp-graph');
+  svg.setAttribute('width', laneCount * LANE_W);
+  svg.setAttribute('height', ROW_H);
+  const x = (lane) => lane * LANE_W + LANE_W / 2;
+  const mid = ROW_H / 2;
+  const color = (lane) => LANE_COLORS[lane % LANE_COLORS.length];
+  const line = (lane, x1, y1, x2, y2) => {
+    const l = document.createElementNS(SVG_NS, 'line');
+    for (const [k, v] of Object.entries({ x1, y1, x2, y2 })) l.setAttribute(k, v);
+    l.setAttribute('stroke', color(lane));
+    svg.appendChild(l);
+  };
+
+  for (const lane of row.above) {
+    if (lane === row.lane) line(lane, x(lane), 0, x(lane), mid);
+    else if (row.joins.includes(lane)) line(lane, x(lane), 0, x(row.lane), mid);
+    else line(lane, x(lane), 0, x(lane), ROW_H);
+  }
+  if (row.below.includes(row.lane)) line(row.lane, x(row.lane), mid, x(row.lane), ROW_H);
+
+  const dot = document.createElementNS(SVG_NS, 'circle');
+  dot.setAttribute('class', 'cp-dot');
+  dot.setAttribute('cx', x(row.lane));
+  dot.setAttribute('cy', mid);
+  dot.style.color = color(row.lane);
+  svg.appendChild(dot);
+  return svg;
+}
+
+/** HH:MM for today, otherwise prefixed with a short date. */
+function formatCheckpointTime(iso) {
+  const d = new Date(iso);
+  const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  if (d.toDateString() === new Date().toDateString()) return time;
+  return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${time}`;
+}
+
+/**
+ * `.cp-node` row: lane graph, label, optional ref badges, timestamp. No listeners attached.
+ * @param {{active: boolean, refs: boolean}} opts `refs` adds branch/tag badges.
+ */
+function createHistoryRow(cp, row, laneCount, { active, refs }) {
+  const node = document.createElement('div');
+  node.className = 'cp-node' + (active ? ' active' : '');
+  node.dataset.id = row.id;
+  node.appendChild(createGraphCell(row, laneCount));
+
+  const label = document.createElement('span');
+  label.className = 'cp-label';
+  label.textContent = cp.label || cp.file;
+  node.appendChild(label);
+
+  for (const ref of refs ? cp.refs || [] : []) {
+    const badge = document.createElement('span');
+    badge.className = 'cp-ref' + (ref === checkpointState.branch ? ' head' : '');
+    badge.textContent = ref;
+    node.appendChild(badge);
+  }
+
+  const time = document.createElement('span');
+  time.className = 'cp-time';
+  time.textContent = formatCheckpointTime(cp.created);
+  node.appendChild(time);
+  return node;
+}
 
 function renderTree() {
   const { checkpoints, active } = checkpointState;
   treeEl.innerHTML = '';
 
   if (Object.keys(checkpoints).length === 0) {
-    treeEl.innerHTML =
-      '<div class="cp-empty">No checkpoints yet.<br>Ask Claude to create a model!</div>';
+    const empty = document.createElement('div');
+    empty.className = 'cp-empty';
+    if (checkpointState.gitError) {
+      empty.textContent = checkpointState.gitError;
+    } else {
+      empty.innerHTML = 'No history yet.<br>Ask Claude to create a model!';
+    }
+    treeEl.appendChild(empty);
     return;
   }
 
-  // Build adjacency
-  const children = {};
-  const roots = [];
-  for (const [id, cp] of Object.entries(checkpoints)) {
-    if (!cp.parent || !checkpoints[cp.parent]) {
-      roots.push(id);
-    } else {
-      if (!children[cp.parent]) children[cp.parent] = [];
-      children[cp.parent].push(id);
-    }
-  }
-
-  const sortByTime = (ids) =>
-    ids.sort(
-      (a, b) =>
-        new Date(checkpoints[a].created) - new Date(checkpoints[b].created)
-    );
-
-  function renderNode(id, depth, isLastFlags) {
+  const { rows, laneCount } = layoutHistory(checkpoints);
+  for (const row of rows) {
+    const id = row.id;
     const cp = checkpoints[id];
-    const isActive = id === active;
-    const isRoot = depth === 0;
-
-    const node = document.createElement('div');
-    node.className = 'cp-node' + (isActive ? ' active' : '');
-    node.dataset.id = id;
-    node.dataset.depth = depth;
-
-    // Tree prefix with box-drawing characters
-    if (depth > 0) {
-      const pre = document.createElement('span');
-      pre.className = 'cp-prefix';
-      let str = '';
-      for (let i = 0; i < depth - 1; i++) {
-        str += isLastFlags[i] ? '   ' : '\u2502  ';
-      }
-      str += isLastFlags[depth - 1] ? '\u2514\u2500 ' : '\u251C\u2500 ';
-      pre.textContent = str;
-      node.appendChild(pre);
-    }
-
-    const dot = document.createElement('span');
-    dot.className = 'cp-dot' + (isRoot ? ' root' : '');
-    node.appendChild(dot);
-
-    const label = document.createElement('span');
-    label.className = 'cp-label';
-    label.textContent = cp.label || cp.file;
-    node.appendChild(label);
-
-    const time = document.createElement('span');
-    time.className = 'cp-time';
-    const d = new Date(cp.created);
-    time.textContent = d.toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit',
-    });
-    node.appendChild(time);
+    const node = createHistoryRow(cp, row, laneCount, { active: id === active, refs: true });
 
     node.addEventListener('click', () => {
       window.api.selectCheckpoint(id);
@@ -1133,14 +1187,11 @@ function renderTree() {
       contextMenuTargetId = id;
       const menu = document.getElementById('cp-context-menu');
 
-      // Update menu items based on node state
-      const hasKids = (children[id] || []).length > 0;
-      const collapseItem = menu.querySelector('[data-action="collapse"]');
-      collapseItem.textContent = collapsedNodes.has(id) ? 'Expand Children' : 'Collapse Children';
-      collapseItem.style.display = hasKids ? '' : 'none';
-
       const sessionItem = menu.querySelector('[data-action="resume-session"]');
       sessionItem.style.display = cp.sessionId ? '' : 'none';
+
+      const deleteItem = menu.querySelector('[data-action="delete"]');
+      deleteItem.style.display = deletableBranches(cp).length > 0 ? '' : 'none';
 
       menu.classList.remove('hidden');
       menu.style.left = e.clientX + 'px';
@@ -1157,7 +1208,7 @@ function renderTree() {
     // Tooltip on hover
     node.addEventListener('mouseenter', (e) => {
       const desc = cp.description || '';
-      const meta = [cp.file];
+      const meta = [cp.sha ? cp.sha.slice(0, 7) : cp.file];
       if (cp.sessionId) meta.push('session linked');
       const d2 = new Date(cp.created);
       meta.push(d2.toLocaleString());
@@ -1185,40 +1236,10 @@ function renderTree() {
       document.getElementById('cp-tooltip').classList.add('hidden');
     });
 
-    // Show collapse indicator if has children
-    const hasKids = (children[id] || []).length > 0;
-    if (hasKids) {
-      const collapseIcon = document.createElement('span');
-      collapseIcon.className = 'cp-collapse-icon';
-      collapseIcon.textContent = collapsedNodes.has(id) ? '\u25B6' : '\u25BC';
-      collapseIcon.addEventListener('click', (e) => {
-        e.stopPropagation();
-        if (collapsedNodes.has(id)) collapsedNodes.delete(id);
-        else collapsedNodes.add(id);
-        renderTree();
-      });
-      node.appendChild(collapseIcon);
-    }
-
     treeEl.appendChild(node);
-
-    // Render children (unless collapsed)
-    if (!collapsedNodes.has(id)) {
-      const kids = children[id] || [];
-      sortByTime(kids);
-      for (let i = 0; i < kids.length; i++) {
-        renderNode(kids[i], depth + 1, [
-          ...isLastFlags,
-          i === kids.length - 1,
-        ]);
-      }
-    }
   }
 
-  sortByTime(roots);
-  for (const root of roots) {
-    renderNode(root, 0, []);
-  }
+  treeEl.querySelector('.cp-node.active')?.scrollIntoView({ block: 'nearest' });
 }
 
 // ── Inline Rename & Delete Confirm ───────────────────────────────────────
@@ -1259,21 +1280,28 @@ function showRenameInput(cpId, currentName) {
   input.addEventListener('blur', commit);
 }
 
-function showDeleteConfirm(cpId, name) {
+/** Local branches ending at `cp` that may be deleted (all but the checked-out one). */
+function deletableBranches(cp) {
+  return (cp && cp.branches ? cp.branches : []).filter((b) => b !== checkpointState.branch);
+}
+
+function showDeleteConfirm(cpId, branches) {
   // Show a small inline confirmation bar at the top of the checkpoint tree
   const bar = document.createElement('div');
   bar.className = 'cp-delete-bar';
   bar.innerHTML = `
-    <span>Delete "${name}"?</span>
+    <span></span>
     <button class="cp-delete-yes">Delete</button>
     <button class="cp-delete-no">Cancel</button>
   `;
+  bar.querySelector('span').textContent =
+    `Delete branch ${branches.map((b) => `"${b}"`).join(', ')}? Its unshared commits disappear from history.`;
   treeEl.prepend(bar);
 
-  bar.querySelector('.cp-delete-yes').addEventListener('click', () => {
-    window.api.deleteCheckpoint(cpId);
-    showToast('Checkpoint deleted', 'info');
+  bar.querySelector('.cp-delete-yes').addEventListener('click', async () => {
     bar.remove();
+    const deleted = await window.api.deleteCheckpoint(cpId);
+    if (deleted && deleted.length) showToast(`Deleted branch ${deleted.join(', ')}`, 'info');
   });
   bar.querySelector('.cp-delete-no').addEventListener('click', () => {
     bar.remove();
@@ -1304,13 +1332,8 @@ cpContextMenu.addEventListener('click', async (e) => {
       break;
     }
     case 'delete': {
-      showDeleteConfirm(id, cp?.label || cp?.file || '');
-      break;
-    }
-    case 'collapse': {
-      if (collapsedNodes.has(id)) collapsedNodes.delete(id);
-      else collapsedNodes.add(id);
-      renderTree();
+      const branches = deletableBranches(cp);
+      if (branches.length) showDeleteConfirm(id, branches);
       break;
     }
     case 'view-source': {
@@ -1328,11 +1351,26 @@ cpContextMenu.addEventListener('click', async (e) => {
     }
     case 'branch-here': {
       window.api.selectCheckpoint(id);
-      showToast(`Branching from "${cp?.label || cp?.file}" — next model will be a child`, 'info');
+      showToast(`Checked out "${cp?.label || cp?.file}" — the next change starts a new branch here`, 'info');
       break;
     }
   }
 });
+
+const pushBtn = document.getElementById('push-btn');
+pushBtn.addEventListener('click', async () => {
+  pushBtn.disabled = true;
+  showToast('Pushing to origin…', 'info');
+  const result = await window.api.pushHistory();
+  pushBtn.disabled = false;
+  if (result && result.ok) showToast('Pushed to origin', 'success');
+  else showToast(`Push failed: ${result ? result.error : 'unknown error'}`, 'error');
+});
+
+window.api.onGitError(({ message }) => showToast(`git: ${message}`, 'error'));
+
+// Picks up commits made outside the app (pull, terminal, other tools).
+window.addEventListener('focus', () => window.api.refreshCheckpoints());
 
 // Resume session button in checkpoint header
 const resumeSessionBtn = document.getElementById('resume-session-btn');
@@ -1365,9 +1403,9 @@ window.api.onCheckpointUpdate((state) => {
   // Refresh viewport 2's tree if open
   if (viewport2 && viewport2._cpListener) viewport2._cpListener();
 
-  // Instant model switch if we have this checkpoint cached
-  if (state.active && state.active !== currentCheckpointId) {
-    if (showCachedModel(state.active)) {
+  // Instant model switch if this version's sources were loaded before
+  if (state.activeKey && state.activeKey !== currentModelKey) {
+    if (showCachedModel(state.activeKey)) {
       hideRenderOverlay();
     }
   }
@@ -1825,14 +1863,11 @@ function pickObject(e) {
   raycaster.setFromCamera(mouseNDC, activeCamera);
 
   const targets = currentMesh.isGroup ? currentMesh.children : [currentMesh];
-  const intersects = raycaster.intersectObjects(targets, true);
-
-  if (intersects.length > 0) {
-    const hit = intersects[0].object;
-    if (hit.isMesh) {
-      selectPart(hit);
-      return;
-    }
+  // The raycaster ignores `visible`, so hidden parts are filtered here.
+  const hit = raycaster.intersectObjects(targets, true).find((h) => h.object.isMesh && isShown(h.object));
+  if (hit) {
+    selectPart(hit.object);
+    return;
   }
   deselectPart();
 }
@@ -1854,6 +1889,7 @@ function selectPart(mesh) {
   // Show properties panel
   refreshPropsPanel(mesh);
   document.getElementById('part-props').classList.remove('hidden');
+  highlightPartRow();
 }
 
 function deselectPart() {
@@ -1864,7 +1900,132 @@ function deselectPart() {
   }
   selectedMesh = null;
   document.getElementById('part-props').classList.add('hidden');
+  highlightPartRow();
 }
+
+// ── Parts Panel ─────────────────────────────────────────────────────────
+// Lists the top-level objects of a 3MF model (one per top-level statement,
+// rendered with lazy-union) with show/hide toggles. Hidden parts are tracked by
+// name, so they stay hidden across re-renders and history switches.
+
+const hiddenParts = new Set();
+const partsPanel = document.getElementById('parts-panel');
+const partsList = document.getElementById('parts-list');
+const EYE_OPEN = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M1 8s2.5-5 7-5 7 5 7 5-2.5 5-7 5-7-5-7-5z"/><circle cx="8" cy="8" r="2"/></svg>';
+const EYE_CLOSED = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M1 8s2.5-5 7-5 7 5 7 5-2.5 5-7 5-7-5-7-5z"/><path d="M2 2l12 12"/></svg>';
+
+function modelParts() {
+  return currentMesh && currentMesh.isGroup ? currentMesh.children : [];
+}
+
+/** Names each top-level object of a parsed 3MF group, and its meshes, from the source's parts. */
+function nameParts(group, parts) {
+  const names = resolvePartNames(parts, group.children.length);
+  group.children.forEach((obj, i) => {
+    const name = names ? names[i] : `Part ${i + 1}`;
+    obj.name = name;
+    obj.traverse((m) => { if (m.isMesh) m.name = name; });
+  });
+}
+
+function isShown(obj) {
+  for (let o = obj; o; o = o.parent) if (!o.visible) return false;
+  return true;
+}
+
+/** Top-level part (direct child of the model group) containing `mesh`. */
+function partOf(mesh) {
+  let o = mesh;
+  while (o && o.parent && o.parent !== currentMesh) o = o.parent;
+  return o && o.parent === currentMesh ? o : null;
+}
+
+function applyPartVisibility() {
+  for (const obj of modelParts()) obj.visible = !hiddenParts.has(obj.name);
+  if (selectedMesh && !isShown(selectedMesh)) deselectPart();
+}
+
+function setPartVisibility(change) {
+  change();
+  applyPartVisibility();
+  renderPartsPanel();
+}
+
+function partColor(obj) {
+  let color = null;
+  obj.traverse((m) => {
+    if (!color && m.isMesh && m.material && m.material.color) color = '#' + m.material.color.getHexString();
+  });
+  return color || '#4488ff';
+}
+
+function highlightPartRow() {
+  const selected = selectedMesh ? partOf(selectedMesh) : null;
+  const parts = modelParts();
+  partsList.querySelectorAll('.part-row').forEach((row) => {
+    row.classList.toggle('selected', parts[Number(row.dataset.index)] === selected);
+  });
+}
+
+function renderPartsPanel() {
+  const parts = modelParts();
+  partsPanel.classList.toggle('hidden', parts.length < 2);
+  partsList.innerHTML = '';
+  if (parts.length < 2) return;
+  const shown = parts.filter((p) => p.visible).length;
+  document.getElementById('parts-count').textContent = `${shown}/${parts.length}`;
+
+  parts.forEach((obj, index) => {
+    const row = document.createElement('div');
+    row.className = 'part-row' + (obj.visible ? '' : ' part-hidden');
+    row.dataset.index = index;
+
+    const eye = document.createElement('button');
+    eye.className = 'part-eye';
+    eye.title = obj.visible ? 'Hide' : 'Show';
+    eye.innerHTML = obj.visible ? EYE_OPEN : EYE_CLOSED;
+    eye.addEventListener('click', (e) => {
+      e.stopPropagation();
+      setPartVisibility(() => {
+        if (hiddenParts.has(obj.name)) hiddenParts.delete(obj.name);
+        else hiddenParts.add(obj.name);
+      });
+    });
+
+    const dot = document.createElement('span');
+    dot.className = 'part-dot';
+    dot.style.background = partColor(obj);
+
+    const name = document.createElement('span');
+    name.className = 'part-name';
+    name.textContent = obj.name;
+    name.title = 'Click to select · double-click to show only this part';
+
+    row.append(eye, dot, name);
+    row.addEventListener('click', () => {
+      if (!obj.visible) return;
+      let first = null;
+      obj.traverse((m) => { if (!first && m.isMesh) first = m; });
+      if (first) selectPart(first);
+    });
+    row.addEventListener('dblclick', () => {
+      setPartVisibility(() => {
+        hiddenParts.clear();
+        for (const other of parts) if (other !== obj) hiddenParts.add(other.name);
+      });
+    });
+    partsList.appendChild(row);
+  });
+  highlightPartRow();
+}
+
+document.getElementById('parts-show-all').addEventListener('click', (e) => {
+  e.stopPropagation();
+  setPartVisibility(() => hiddenParts.clear());
+});
+document.getElementById('parts-header').addEventListener('click', () => {
+  partsPanel.classList.toggle('collapsed');
+});
 
 function refreshPropsPanel(mesh) {
   const geo = mesh.geometry;
@@ -2289,44 +2450,12 @@ function addSecondViewport() {
       v2.treeEl.innerHTML = '<div class="cp-empty">No checkpoints</div>';
       return;
     }
-    const children2 = {};
-    const roots2 = [];
-    for (const [id, cp] of Object.entries(checkpoints)) {
-      if (!cp.parent || !checkpoints[cp.parent]) roots2.push(id);
-      else { if (!children2[cp.parent]) children2[cp.parent] = []; children2[cp.parent].push(id); }
-    }
-    const sort2 = (ids) => ids.sort((a, b) => new Date(checkpoints[a].created) - new Date(checkpoints[b].created));
-
-    function renderN2(id, depth, flags) {
-      const cp = checkpoints[id];
-      const node = document.createElement('div');
-      node.className = 'cp-node' + (id === v2.selectedCpId ? ' active' : '');
-      if (depth > 0) {
-        const pre = document.createElement('span');
-        pre.className = 'cp-prefix';
-        let s = '';
-        for (let i = 0; i < depth-1; i++) s += flags[i] ? '   ' : '\u2502  ';
-        s += flags[depth-1] ? '\u2514\u2500 ' : '\u251C\u2500 ';
-        pre.textContent = s;
-        node.appendChild(pre);
-      }
-      const dot = document.createElement('span');
-      dot.className = 'cp-dot' + (depth === 0 ? ' root' : '');
-      node.appendChild(dot);
-      const lbl = document.createElement('span');
-      lbl.className = 'cp-label';
-      lbl.textContent = cp.label || cp.file;
-      node.appendChild(lbl);
-      node.addEventListener('click', () => v2SelectCheckpoint(id));
+    const { rows, laneCount } = layoutHistory(checkpoints);
+    for (const row of rows) {
+      const node = createHistoryRow(checkpoints[row.id], row, laneCount, { active: row.id === v2.selectedCpId, refs: false });
+      node.addEventListener('click', () => v2SelectCheckpoint(row.id));
       v2.treeEl.appendChild(node);
-
-      const kids = children2[id] || [];
-      sort2(kids);
-      for (let i = 0; i < kids.length; i++) renderN2(kids[i], depth+1, [...flags, i === kids.length-1]);
     }
-
-    sort2(roots2);
-    for (const r of roots2) renderN2(r, 0, []);
   }
 
   // --- Select a checkpoint in viewport 2 ---
@@ -2336,33 +2465,15 @@ function addSecondViewport() {
     v2.selectedCpId = id;
     renderV2Tree();
 
-    // Load source code
-    const scadPath = await window.api.getWorkspace() + '/' + cp.file;
-    const content = await window.api.readFile(scadPath);
+    // Source and cached render come straight from the commit; the working tree is untouched.
+    v2.statusEl.textContent = `Loading ${cp.label || cp.file}...`;
+    const result = await window.api.getCheckpoint(id);
+    if (v2.selectedCpId !== id) return;
     v2.editorFilename.textContent = cp.file;
-    v2.editorContent.textContent = content || '// Could not read file';
+    v2.editorContent.textContent = (result && result.source) || '// Could not read file';
 
-    // Load model — check for 3MF then STL
-    const basePath = scadPath.replace(/\.scad$/, '');
-    let modelData = null;
-    let format = 'stl';
-
-    for (const [ext, fmt] of [['.3mf', '3mf'], ['.stl', 'stl']]) {
-      const data = await window.api.readFile(basePath + ext);
-      // readFile returns string for text files — we need binary
-      // Fall back to the main process render flow
-      if (data !== null) { format = fmt; break; }
-    }
-
-    // Request the main process to send us the model data
-    // Use the existing checkpoint:select which sends model:update
-    // But that would change the primary viewport. Instead, load from file via IPC.
-    v2.statusEl.textContent = `Loading ${cp.file}...`;
-
-    // Direct file read for binary model — use a special IPC
-    const result = await window.api.readModelFile(basePath + (format === '3mf' ? '.3mf' : '.stl'), format);
     if (result && result.data) {
-      v2LoadModel(result.data, format);
+      v2LoadModel(result.data, result.format);
       v2.statusEl.textContent = cp.label || cp.file;
     } else {
       v2.statusEl.textContent = 'No rendered model — select in primary viewport first';
@@ -2378,7 +2489,7 @@ function addSecondViewport() {
     let mesh;
 
     if (format === '3mf') {
-      const group = new ThreeMFLoader().parse(bytes.buffer);
+      const group = new ThreeMFLoader().parse(toArrayBuffer(bytes));
       const box = new THREE.Box3().setFromObject(group);
       const center = new THREE.Vector3();
       box.getCenter(center);
@@ -2393,7 +2504,7 @@ function addSecondViewport() {
       const size = new THREE.Vector3(); box.getSize(size);
       v2.modelBounds = { maxDim: Math.max(size.x, size.y, size.z), size };
     } else {
-      const geo = new STLLoader().parse(bytes.buffer);
+      const geo = new STLLoader().parse(toArrayBuffer(bytes));
       const issues = validateAndRepairGeometry(geo);
       mesh = new THREE.Mesh(geo, modelMaterial.clone());
       geo.computeBoundingBox();

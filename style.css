@@ -511,7 +511,7 @@ body.dragging #splitter {
 
 .vp2-checkpoint-tree {
   overflow-y: auto;
-  padding: 4px 0;
+  padding: 0;
   flex: 1;
 }
 
@@ -630,6 +630,129 @@ body.dragging #splitter {
 
 #part-props.hidden {
   display: none;
+}
+
+#parts-panel {
+  position: absolute;
+  top: 12px;
+  right: 56px;
+  width: 200px;
+  max-height: 50%;
+  display: flex;
+  flex-direction: column;
+  background: rgba(10, 10, 26, 0.92);
+  border: 1px solid #2a2a5a;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  z-index: 15;
+  backdrop-filter: blur(8px);
+  font-size: 11px;
+  overflow: hidden;
+}
+
+#parts-panel.hidden {
+  display: none;
+}
+
+#parts-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid #1a1a3a;
+  cursor: pointer;
+  user-select: none;
+}
+
+#parts-panel.collapsed #parts-header {
+  border-bottom: none;
+}
+
+#parts-panel.collapsed #parts-list {
+  display: none;
+}
+
+#parts-count {
+  color: #555577;
+  font-variant-numeric: tabular-nums;
+}
+
+#parts-show-all {
+  border: none;
+  background: transparent;
+  color: #5566aa;
+  font-size: 10px;
+  font-family: inherit;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 3px;
+}
+
+#parts-show-all:hover {
+  background: #1a1a3a;
+  color: #8899cc;
+}
+
+#parts-list {
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.part-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.part-row:hover {
+  background: #14142e;
+}
+
+.part-row.selected {
+  background: #1a1a44;
+}
+
+.part-eye {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: #8899cc;
+  cursor: pointer;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.part-eye svg {
+  width: 14px;
+  height: 14px;
+}
+
+.part-dot {
+  width: 8px;
+  height: 8px;
+  flex-shrink: 0;
+  border-radius: 50%;
+}
+
+.part-name {
+  flex: 1;
+  color: #b0b0d0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.part-row.part-hidden .part-name,
+.part-row.part-hidden .part-dot,
+.part-row.part-hidden .part-eye {
+  opacity: 0.4;
 }
 
 #part-props-header {
@@ -1200,7 +1323,7 @@ body.dragging #splitter {
 #checkpoint-tree {
   flex: 1;
   overflow-y: auto;
-  padding: 6px 0;
+  padding: 0;
 }
 
 #checkpoint-tree::-webkit-scrollbar {
@@ -1234,7 +1357,8 @@ body.dragging #splitter {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 12px;
+  height: 24px; /* = ROW_H in renderer.js; lanes span the full row */
+  padding: 0 12px 0 6px;
   cursor: pointer;
   font-size: 12px;
   transition: background 0.15s;
@@ -1249,49 +1373,33 @@ body.dragging #splitter {
   background: #151538;
 }
 
-.cp-prefix {
-  color: #2a2a5a;
-  font-family: "JetBrains Mono", Menlo, Monaco, monospace;
-  font-size: 12px;
-  white-space: pre;
+.cp-graph {
   flex-shrink: 0;
-  line-height: 1;
+  overflow: visible;
 }
 
+.cp-graph line {
+  stroke-width: 1.5;
+  stroke-opacity: 0.55;
+}
+
+/* Lane color arrives via inline `color`; hollow until active. */
 .cp-dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  border: 2px solid #2a2a55;
-  background: transparent;
-  flex-shrink: 0;
-  transition: all 0.2s;
-}
-
-.cp-dot.root {
-  border-color: #337744;
-}
-
-.cp-node.active .cp-dot {
-  background: #4488ff;
-  border-color: #4488ff;
-  box-shadow: 0 0 8px #4488ff55;
-  animation: dotPulse 2s ease-in-out infinite;
-}
-
-.cp-node.active .cp-dot.root {
-  background: #44cc77;
-  border-color: #44cc77;
-  box-shadow: 0 0 8px #44cc7755;
-}
-
-@keyframes dotPulse {
-  0%, 100% { box-shadow: 0 0 6px #4488ff44; }
-  50% { box-shadow: 0 0 12px #4488ff66; }
+  r: 3.5px;
+  fill: #0a0a18;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  transition: r 0.15s;
 }
 
 .cp-node:hover .cp-dot {
-  border-color: #4466aa;
+  r: 4.5px;
+}
+
+.cp-node.active .cp-dot {
+  r: 5px;
+  fill: currentColor;
+  filter: drop-shadow(0 0 4px currentColor);
 }
 
 .cp-label {
@@ -1310,6 +1418,25 @@ body.dragging #splitter {
 
 .cp-node:hover .cp-label {
   color: #9999bb;
+}
+
+.cp-ref {
+  flex-shrink: 0;
+  max-width: 110px;
+  padding: 0 5px;
+  border: 1px solid #2a2a5a;
+  border-radius: 8px;
+  color: #6677aa;
+  font-size: 9px;
+  line-height: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cp-ref.head {
+  border-color: #4466aa;
+  color: #8be9fd;
 }
 
 .cp-rename-input {
@@ -1363,20 +1490,6 @@ body.dragging #splitter {
 
 .cp-delete-no:hover {
   background: #1a1a3a;
-}
-
-.cp-collapse-icon {
-  font-size: 8px;
-  color: #444466;
-  cursor: pointer;
-  margin-left: 4px;
-  padding: 2px;
-  flex-shrink: 0;
-  transition: color 0.1s;
-}
-
-.cp-collapse-icon:hover {
-  color: #8888bb;
 }
 
 .cp-time {

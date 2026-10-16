@@ -63,6 +63,16 @@
           <!-- Toolbars (floating, split left/right) -->
           <div id="viewport-toolbar-left"></div>
           <div id="viewport-toolbar-right"></div>
+          <!-- Parts list (floating, top-right; shown for multi-part 3MF models) -->
+          <div id="parts-panel" class="hidden">
+            <div id="parts-header" title="Toggle parts list">
+              <span class="label">Parts</span>
+              <span id="parts-count"></span>
+              <span class="spacer"></span>
+              <button id="parts-show-all" title="Show all parts">Show all</button>
+            </div>
+            <div id="parts-list"></div>
+          </div>
           <!-- View presets (floating, bottom-left) -->
           <div id="view-presets"></div>
           <!-- Part properties panel (floating, bottom-right) -->
@@ -131,6 +141,7 @@
             <span class="label">History</span>
             <span class="spacer"></span>
             <button id="resume-session-btn" class="small-btn hidden" title="Resume the Claude session that created this checkpoint">Resume Session</button>
+            <button id="push-btn" class="small-btn" title="git push -u origin HEAD">Push</button>
           </div>
           <div id="checkpoint-tree"></div>
         </div>
@@ -140,10 +151,9 @@
           <button class="ctx-item" data-action="view-source">View Source</button>
           <button class="ctx-item" data-action="resume-session">Resume Session</button>
           <div class="ctx-divider"></div>
-          <button class="ctx-item" data-action="collapse">Collapse Children</button>
           <button class="ctx-item" data-action="branch-here">Branch from Here</button>
           <div class="ctx-divider"></div>
-          <button class="ctx-item ctx-danger" data-action="delete">Delete</button>
+          <button class="ctx-item ctx-danger" data-action="delete">Delete Branch</button>
         </div>
         <!-- Checkpoint tooltip -->
         <div id="cp-tooltip" class="hidden">
